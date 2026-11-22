@@ -1,0 +1,8 @@
+FROM golang:alpine AS mc-builder
+RUN apk add --no-cache git
+RUN go install github.com/minio/mc@latest
+
+FROM trinodb/trino:455
+USER root
+COPY --from=mc-builder /go/bin/mc /usr/bin/mc
+RUN chmod +x /usr/bin/mc

@@ -1,0 +1,10 @@
+FROM golang:alpine AS minio-builder
+RUN apk add --no-cache git
+RUN CGO_ENABLED=0 go install github.com/minio/minio@latest
+
+FROM alpine:latest
+RUN apk add --no-cache curl ca-certificates
+COPY --from=minio-builder /go/bin/minio /usr/bin/minio
+RUN chmod +x /usr/bin/minio
+
+ENTRYPOINT ["minio"]
