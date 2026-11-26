@@ -104,7 +104,7 @@ def process_table(spark, table_name):
     cfg = SILVER_CONFIG[table_name]
     keys = cfg["unique_keys"]
     input_rows = output_rows = rejected_rows = 0
-    df_clean = None
+    df_raw = df_clean = df_out = None
 
     print(f"\n========== SILVER: {table_name} ==========")
     try:
@@ -118,15 +118,24 @@ def process_table(spark, table_name):
             return
 
         df_raw = df_raw.persist(StorageLevel.MEMORY_AND_DISK)
-        input_rows = df_raw.count()
 
-        df_clean = clean(df_raw, cfg)
+        # Gộp count và lấy watermark vào 1 action duy nhất
+        stats = df_raw.agg(F.count("*").alias("cnt"), spark_max("ingest_at").alias("w")).first()
+        input_rows = stats["cnt"]
+        new_watermark = stats["w"]
+
+        # Persist df_clean NGAY SAU clean() để tránh chạy lại shuffle dedupe_by_key nhiều lần
+        df_clean = clean(df_raw, cfg).persist(StorageLevel.MEMORY_AND_DISK)
 
         # ---- Completeness: mất dòng khi làm sạch + quarantine phần bị loại ----
         df_clean = validate_row_count(
             spark, run_id, df_raw, df_clean, layer=layer, table_name=table_name, rundate=rundate,
             max_loss_pct=10.0, key_columns=keys, severity="BLOCKING",
         )
+
+        # Giải phóng df_raw ngay sau khi dùng xong để nhường RAM cho business rules & Delta merge
+        df_raw.unpersist()
+        df_raw = None
 
         # ---- Validity: business rules ----
         for rule_name, (cond_fn, severity, max_pct) in cfg["business_rules"].items():
@@ -137,24 +146,23 @@ def process_table(spark, table_name):
             )
 
         ingest_time = spark.sql("SELECT current_timestamp()").first()[0]
-        df_clean = (df_clean.withColumn("ingest_at", lit(ingest_time))
-                    .withColumn("source", lit("bronze"))
-                    .persist(StorageLevel.MEMORY_AND_DISK))
+        df_out = (df_clean.withColumn("ingest_at", lit(ingest_time))
+                  .withColumn("source", lit("bronze"))
+                  .persist(StorageLevel.MEMORY_AND_DISK))
 
         if not spark.catalog.tableExists(silver_table):
-            df_clean.write.format("delta").mode("overwrite").saveAsTable(silver_table)
+            df_out.write.format("delta").mode("overwrite").saveAsTable(silver_table)
             print(f"[Silver] Created {silver_table}")
         else:
             cond = " AND ".join(f"tgt.{k} = src.{k}" for k in keys)
             (DeltaTable.forName(spark, silver_table).alias("tgt")
-             .merge(df_clean.alias("src"), cond)
+             .merge(df_out.alias("src"), cond)
              .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
             print(f"[Silver] MERGE completed: {silver_table}")
 
-        output_rows = df_clean.count()
+        output_rows = df_out.count()
         rejected_rows = input_rows - output_rows
 
-        new_watermark = df_raw.select(spark_max("ingest_at").alias("w")).first()["w"]
         insert_log(spark=spark, layer=layer, table_name=table_name,
                    watermark_column="ingest_at", watermark_value=new_watermark, rundate=rundate)
 
@@ -172,8 +180,9 @@ def process_table(spark, table_name):
         print(f"[AUDIT] FAILED run_id={run_id}: {e}")
         raise
     finally:
-        if df_clean is not None:
-            df_clean.unpersist()
+        for d in (df_raw, df_clean, df_out):
+            if d is not None:
+                d.unpersist()
 
 
 def parse_args():

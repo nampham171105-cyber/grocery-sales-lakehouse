@@ -2,9 +2,10 @@
 import argparse
 from datetime import datetime, date
 
+from pyspark import StorageLevel
 from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import col, lit, broadcast
 
 from job_control import generate_run_id, insert_audit
 from validation import validate_grain, validate_reconciliation
@@ -24,8 +25,7 @@ def pct(num, den):
 
 def with_month(spark, fact: DataFrame) -> DataFrame:
     dim_date = gold(spark, "dim_date").select("date_sk", "year_month")
-    return fact.join(dim_date, "date_sk", "left").withColumn("year_month", F.coalesce(col("year_month"), lit("Unknown")))
-
+    return fact.join(broadcast(dim_date), "date_sk", "left").withColumn("year_month", F.coalesce(col("year_month"), lit("Unknown")))
 
 def _sum(df, c):
     return df.agg(F.sum(c)).first()[0]
@@ -57,7 +57,7 @@ def build_sales_monthly(spark):
 def build_category_monthly(spark):
     fact = with_month(spark, gold(spark, "fact_sales"))
     prod = gold(spark, "dim_product").select("product_sk", "category_name")
-    f = fact.join(prod, "product_sk", "left").withColumn("category_name", F.coalesce(col("category_name"), lit("Unknown")))
+    f = fact.join(broadcast(prod), "product_sk", "left").withColumn("category_name", F.coalesce(col("category_name"), lit("Unknown")))
     wm = Window.partitionBy("year_month")
     wc = Window.partitionBy("category_name").orderBy("year_month")
     df = (f.groupBy("year_month", "category_name").agg(
@@ -111,7 +111,7 @@ def build_class_performance(spark):
     fact = gold(spark, "fact_sales")
     prod = gold(spark, "dim_product").select("product_sk", "class")
     n_prod = prod.groupBy("class").agg(F.count("*").alias("total_products"))
-    agg = (fact.join(prod, "product_sk", "left").withColumn("class", F.coalesce(col("class"), lit("Unknown")))
+    agg = (fact.join(broadcast(prod), "product_sk", "left").withColumn("class", F.coalesce(col("class"), lit("Unknown")))
            .groupBy("class").agg(F.sum("quantity").alias("total_units"), F.sum("net_amount").alias("revenue"),
                                  F.countDistinct("transaction_number").alias("total_orders")))
     w = Window.partitionBy()
@@ -140,9 +140,11 @@ def build_customer_360(spark):
             .withColumn("customer_type", F.when(col("total_orders") == 0, "No purchase")
                                           .when(col("total_orders") == 1, "One-time").otherwise("Repeat")))
     # Ngưỡng tertile của Frequency và Monetary, chỉ tính trên khách đã có mua hàng
+    df = df.persist(StorageLevel.MEMORY_AND_DISK)
     active = df.filter(col("total_orders") > 0)
-    qf = active.approxQuantile("total_orders", [0.33, 0.67], 0.001) or [1, 2]
-    qm = active.approxQuantile("total_spend", [0.33, 0.67], 0.001) or [0, 0]
+    quantiles = active.approxQuantile(["total_orders", "total_spend"], [0.33, 0.67], 0.001)
+    qf = quantiles[0] if quantiles and quantiles[0] else [1, 2]
+    qm = quantiles[1] if quantiles and quantiles[1] else [0, 0]
     score = lambda c, q: F.when(col(c) <= q[0], 1).when(col(c) <= q[1], 2).otherwise(3)
     df = (df.withColumn("frequency_score", F.when(col("total_orders") > 0, score("total_orders", qf)))
             .withColumn("monetary_score", F.when(col("total_orders") > 0, score("total_spend", qm)))
@@ -210,7 +212,7 @@ def build_geo_performance(spark):
     geo = gold(spark, "dim_geography").select("geography_sk", "city_name", "country_name", "country_code")
     cust = gold(spark, "dim_customer").select("customer_sk", "geography_sk")
     key = ["country_name", "country_code", "city_name"]
-    f = (fact.join(cust, "customer_sk", "left").join(geo, "geography_sk", "left")
+    f = (fact.join(broadcast(cust), "customer_sk", "left").join(broadcast(geo), "geography_sk", "left")
              .withColumn("country_name", F.coalesce(col("country_name"), lit("Unknown")))
              .withColumn("city_name", F.coalesce(col("city_name"), lit("Unknown"))))
     agg = f.groupBy(*key).agg(

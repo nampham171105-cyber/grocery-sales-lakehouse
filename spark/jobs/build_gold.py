@@ -155,7 +155,7 @@ def build_fact_sales(spark):
     started_at, rundate = datetime.now(), str(date.today())
     input_rows = output_rows = 0
     print(f"\n========== GOLD: {name} ==========")
-    fact = None
+    df_inc = fact = None
     try:
         last_wm = get_watermark(spark, layer, name)
         df_inc = silver(spark, "sales")
@@ -173,16 +173,20 @@ def build_fact_sales(spark):
             return
 
         df_inc = df_inc.persist(StorageLevel.MEMORY_AND_DISK)
-        input_rows = df_inc.count()
+        stats = df_inc.agg(F.count("*").alias("cnt"), spark_max("ingest_at").alias("w")).first()
+        input_rows, new_wm = stats["cnt"], stats["w"]
 
         # ---- Integrity: khoá ngoại mồ côi (WARNING — dim có thể đến trễ) ----
         for fk, (dim_table, dim_col) in FK_CHECKS.items():
             validate_referential_integrity(
-                spark, run_id, df_fact=df_inc, df_dim=spark.read.table(dim_table).select(dim_col).distinct(),
+                spark, run_id, df_fact=df_inc, df_dim=broadcast(spark.read.table(dim_table).select(dim_col).distinct()),
                 fact_key=fk, dim_key=dim_col, layer=layer, table_name=name, rundate=rundate,
                 max_orphan_pct=5.0, severity="WARNING")
 
         fact = build_fact_sales_df(spark, df_inc).persist(StorageLevel.MEMORY_AND_DISK)
+        output_rows = fact.count()  # materialize fact xong rồi xả df_inc ngay
+        df_inc.unpersist()
+        df_inc = None
 
         # ---- Accuracy: total_price nguồn vs công thức tự tính ----
         validate_amount_consistency(
@@ -200,9 +204,7 @@ def build_fact_sales(spark):
             (DeltaTable.forName(spark, target).alias("tgt")
              .merge(out.alias("src"), "tgt.sales_id = src.sales_id")
              .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
-        output_rows = fact.count()
 
-        new_wm = df_inc.agg(spark_max("ingest_at")).first()[0]
         insert_log(spark=spark, layer=layer, table_name=name, watermark_column="ingest_at",
                    watermark_value=new_wm, rundate=rundate)
         insert_audit(spark=spark, run_id=run_id, layer=layer, table_name=name, status="PASS",
@@ -215,8 +217,9 @@ def build_fact_sales(spark):
                      output_rows=output_rows, rejected_rows=None, error_message=str(e)[:2000], rundate=rundate)
         raise
     finally:
-        if fact is not None:
-            fact.unpersist()
+        for d in (df_inc, fact):
+            if d is not None:
+                d.unpersist()
 
 
 ALL_GOLD_TABLES = list(DIM_CONFIG.keys()) + ["fact_sales"]

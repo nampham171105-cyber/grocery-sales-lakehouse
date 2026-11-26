@@ -19,7 +19,11 @@ default_args = {
 }
 
 
+HEAVY_TABLES = {"sales", "fact_sales"}
+
+
 def make_spark_task(task_id, script, table, priority_weight, timeout_minutes=BRONZE_SILVER_TIMEOUT_MIN):
+    is_heavy = table in HEAVY_TABLES
     return SparkSubmitOperator(
         task_id=task_id,
         application=f"{SPARK_JOBS_DIR}/{script}",
@@ -28,8 +32,9 @@ def make_spark_task(task_id, script, table, priority_weight, timeout_minutes=BRO
         weight_rule="absolute",
         execution_timeout=timedelta(minutes=timeout_minutes),
         conf={
-            "spark.cores.max": "1",                    # mỗi task tối đa 1 core
-            "spark.executor.memory": "1g",
+            "spark.cores.max": "2" if is_heavy else "1",
+            "spark.executor.memory": "1800m" if is_heavy else "1g",
+            "spark.sql.shuffle.partitions": "8" if is_heavy else "4",
             "spark.driver.host": "airflow-scheduler",  # chỉ đường cho worker gọi về driver
             "spark.driver.bindAddress": "0.0.0.0",
         },

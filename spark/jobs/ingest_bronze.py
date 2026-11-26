@@ -74,6 +74,7 @@ def _base_reader(spark):
         spark.read.format("jdbc")
         .option("url", JDBC_URL).option("user", JDBC_USER)
         .option("password", JDBC_PASSWORD).option("driver", "org.postgresql.Driver")
+        .option("fetchsize", "10000")
     )
 
 
